@@ -93,6 +93,18 @@ python scripts/usage_audit.py --out 报告.md --csv 明细.csv --json  # 一次�
 | 文字报告、CSV/JSON、问答式审计 | 本技能 |
 | 可视化看板（日历热力图、0–24 时模型分布、三级下钻） | [token-dashboard](https://github.com/fuyi-git/token-dashboard) |
 
+## 自测
+
+技能自带一个可移植性 / 兼容性测试，用合成数据跑，不依赖本机日志：
+
+```bash
+python tests/test_generic.py
+```
+
+它会在临时目录里造一份「异机」账本（别的系统的工作空间名、Anthropic 驼峰风格 usage、
+损坏 JSON 行、缺时间戳的记录、无 usage 的本地事件、缺失的价格表），
+然后断言脚本仍能正确统计。预期以「✅ 全部通过」结尾。
+
 ## 注意
 
 - 会话 jsonl 含完整对话内容，是最敏感的本机文件之一：不要整目录外发，也不要用在线工具分析。
