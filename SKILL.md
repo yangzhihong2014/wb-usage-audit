@@ -1,0 +1,73 @@
+---
+name: wb-usage-audit
+description: 审计本机 WorkBuddy 的模型 token 用量与成本。当用户询问「用了多少 token」「模型消耗了多少」「哪个项目/哪个模型最费」「缓存命中率」「token 成本审计」「外部 API 用量」「最近几天用量」时使用。数据源为本机会话日志里的请求级真实 usage，全程离线、不外发。需要可视化看板（日历热力图/山脊图/三级下钻）时改用 token-dashboard 技能。
+agent_created: true
+---
+
+# WorkBuddy 模型用量审计
+
+## 用途
+
+把本机 WorkBuddy 的模型调用记录汇总成可读的用量报告：总量、按模型、按天、按工作空间、按会话，
+以及缓存命中率与预估金额。适用于**任何模型来源**，包括 `models.json` 里配置的外部 API。
+只读本机文件，不联网、不上传。
+
+## 执行步骤
+
+1. **定位数据目录**：默认 `~/.workbuddy/projects`
+   （Windows：`C:\Users\<用户名>\.workbuddy\projects`；macOS / Linux：`~/.workbuddy/projects`；
+   若设了环境变量 `WORKBUDDY_CONFIG_DIR` 则以它为准）。
+   目录不存在即说明本机还没跑过 WorkBuddy 会话，直接告知用户并结束。
+
+2. **选择 Python**：优先用平台的托管运行时；没有就用系统 `python3`（Windows 为 `python`）。
+   本脚本仅依赖标准库（3.8+），**无需安装任何依赖**。
+
+3. **运行脚本**（脚本与 SKILL.md 同级目录，用绝对路径调用）：
+
+   ```
+   python <skill目录>/scripts/usage_audit.py
+   ```
+
+   按用户问法追加参数，不要无脑全量跑：
+
+   | 用户问法 | 参数 |
+   |---|---|
+   | 「最近一周用了多少」 | `--days 7` |
+   | 「10 月这半个月」 | `--since 2026-10-01 --until 2026-10-14` |
+   | 「deepseek 用了多少」 | `--model deepseek` |
+   | 「novel-writer-agent 这个项目」 | `--ws novel-writer-agent` |
+   | 「每天的趋势」 | `--group day` |
+   | 「看看具体请求」 | `--requests 20` |
+   | 「现在这个会话上下文占了多少」 | `--context` |
+   | 「导出给我」 | `--csv <路径>` 和/或 `--out <工作区>/用量报告.md` |
+
+4. **汇报结果**：不要直接把整段表格贴给用户。挑这些讲：
+   合计 token、日均、请求数与会话数、输入输出比、**缓存命中率**、预估金额、TOP 模型、TOP 工作空间。
+   再用一句话点出最值得注意的事实（例如某个项目占了总量的多数、某天异常高、缓存命中率偏低）。
+
+5. **说明了金额口径**：金额是按 `assets/prices.json` 里的牌价估算的。
+   用户若走第三方中转/自建渠道，提示改用 `--price-in/--price-out/--price-cache` 或在 `assets/prices.json` 里改成真实单价。
+
+## 关键口径（汇报时必须保持正确）
+
+- 数值来自会话记录里的 usage 字段，是**供应商返回的真实用量**，不是本地估算。
+  两套命名都支持：`providerData.rawUsage`（OpenAI / DeepSeek / GLM 风格的
+  `prompt_tokens` / `completion_tokens` / `total_tokens`）与 `providerData.usage`
+  （Anthropic 等驼峰风格的 `inputTokens` / `outputTokens` / `totalTokens`）。
+- **输入 token 已包含缓存命中部分**；「全价输入 = 输入 − 缓存读 − 缓存写」。
+- 子代理日志（`subagents/agent-*.jsonl`）自动归属父会话，不会漏计也不会重复计。
+- 只统计带 usage 的请求；供应商不回 usage 时该模型不会出现在报表里，此时应建议用户去供应商控制台核对。
+- 外部 API 场景下 `workbuddy.db` 的积分（`credit_json`）与费用无关，不要拿它当成本口径。
+
+更细的字段映射、SQL 与常见坑见 `references/data-sources.md`（怀疑数字对不上时再读）。
+
+## 与其他能力的分工
+
+- 需要**可视化看板**（KPI、日历热力图、0–24 时模型山脊图、工作空间→会话→请求三级下钻）：用 `token-dashboard` 技能生成单文件 HTML。
+- 需要**逐条明细或自动化**：用本技能的 `--csv` / `--json` 导出后自行处理。
+
+## 注意事项
+
+- 报告里的工作空间名、会话标题来自本机日志，可能含路径与业务信息，外发前先确认。
+- jsonl 文件含完整对话内容，**不要**整目录上传或用在线工具分析。
+- 一次性扫描上千条记录通常几秒完成；日志目录很大时不要反复全量扫描，先加 `--days` 缩小范围。
