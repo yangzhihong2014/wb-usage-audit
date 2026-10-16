@@ -1,7 +1,8 @@
 # wb-usage-audit
 
-审计 WorkBuddy 的模型 token 用量与成本。扫描本机会话日志里**请求级真实 usage**，输出用量报告，
-支持控制台表格、Markdown、JSON、CSV 四种形式。全程离线，不上传任何数据。
+审计 WorkBuddy 的模型 token 用量、成本与生成速度。用量扫描本机会话日志里**请求级真实 usage**，
+速度取自本机运行日志的耗时记录，输出一份报告，支持控制台表格、Markdown、JSON、CSV 四种形式。
+全程离线，不上传任何数据。
 
 适用于**任何模型来源**，包括在 `models.json` 里配置的外部 API / 中转商。
 
@@ -12,7 +13,8 @@
 - **多维分组**：按模型 / 按天 / 按工作空间 / 按会话，可任意组合
 - **预估金额**：按可配置价格表（`assets/prices.json`）计算，含缓存读价与缓存写 1.25× 输入价
 - **上下文占用**：可选读取 `workbuddy.db` 的 `session_usage`，看每个会话当前占了多少窗口
-- **明细导出**：`--csv` 逐条请求、`--json` 机器可读汇总
+- **生成速度**：按工作区给出生成 tok/s（中位与 P10~P90）、首字延迟、整轮耗时，以及「等待首字」占整轮的比例
+- **明细导出**：`--csv` 逐条请求、`--json` 机器可读汇总（JSON 里含 `speed` 段）
 - **子代理归属**：`subagents/agent-*.jsonl` 自动归到父会话，不漏计也不重复计
 
 ## 安装
@@ -22,12 +24,15 @@ WorkBuddy 用户级技能目录：
 ```
 ~/.workbuddy/skills/wb-usage-audit/
 ├── SKILL.md
+├── README.md
 ├── scripts/usage_audit.py
+├── scripts/context_watch.py
 ├── assets/prices.json
-└── references/data-sources.md
+├── references/data-sources.md
+└── tests/test_generic.py
 ```
 
-- Windows：`C:\Users\<你>\.workbuddy\skills\wb-usage-audit\`
+- Windows：`%USERPROFILE%\.workbuddy\skills\wb-usage-audit\`
 - macOS / Linux：`~/.workbuddy/skills/wb-usage-audit/`
 
 装好后对 WorkBuddy 说「看看我这个月用了多少 token」即可触发。
@@ -45,6 +50,8 @@ python scripts/usage_audit.py --ws my-project                    # 只看某工�
 python scripts/usage_audit.py --group day                        # 只按天看
 python scripts/usage_audit.py --requests 20                      # 附最近 20 条请求明细
 python scripts/usage_audit.py --context                          # 附会话上下文占用
+python scripts/usage_audit.py --no-speed                         # 只要用量，不要生成速度
+python scripts/usage_audit.py --speed-days 14                    # 速度多取几天日志（0=不限）
 python scripts/usage_audit.py --out 报告.md --csv 明细.csv --json  # 一次性导出
 ```
 
@@ -61,6 +68,9 @@ python scripts/usage_audit.py --out 报告.md --csv 明细.csv --json  # 一次�
 | `--top N` | 每组最多显示多少行，默认 25 |
 | `--requests N` | 附最近 N 条请求明细 |
 | `--context` | 附会话上下文占用（读 workbuddy.db） |
+| `--logs <目录>` | 运行日志目录（生成速度的数据源），默认 `~/.workbuddy/logs` |
+| `--no-speed` | 不统计生成速度 |
+| `--speed-days N` | 未指定时间范围时，速度只看最近 N 天日志，`0`=不限（默认 7） |
 | `--prices <json>` | 自定义价格表 |
 | `--price-in/--price-out/--price-cache` | 临时覆盖兜底单价（元/百万 token） |
 | `--no-cost` | 不计算金额 |
@@ -84,6 +94,17 @@ python scripts/usage_audit.py --out 报告.md --csv 明细.csv --json  # 一次�
 价格表在 `assets/prices.json`，**内置的是牌价参考值**。如果你走第三方中转或自建渠道，
 请把条目改成真实单价，否则金额只能用于横向比较「哪个模型/项目更费」，不能当账单。
 
+生成速度来自另一个数据源——本机运行日志 `~/.workbuddy/logs/<日期>/<工作区>__<hash>.log` 里的
+`qua.end` 行（会话账本里没有耗时字段）：
+
+```
+生成速度   = 输出token ÷ (总耗时 − 首字延迟)
+端到端速度 = 输出token ÷ 总耗时
+```
+
+输出 token 已含思考链。日志按日期留存并会被归档清理，所以速度只覆盖最近约两周；
+更早的日期没有速度数据，报告里会显示「未取到速度数据」。
+
 更细的字段映射、SQL 与常见坑见 `references/data-sources.md`。
 
 ## 与 token-dashboard 的分工
@@ -92,6 +113,18 @@ python scripts/usage_audit.py --out 报告.md --csv 明细.csv --json  # 一次�
 |---|---|
 | 文字报告、CSV/JSON、问答式审计 | 本技能 |
 | 可视化看板（日历热力图、0–24 时模型分布、三级下钻） | [token-dashboard](https://github.com/fuyi-git/token-dashboard) |
+
+## 自测
+
+技能自带一个可移植性 / 兼容性测试，用合成数据跑，不依赖本机日志：
+
+```bash
+python tests/test_generic.py
+```
+
+它会在临时目录里造一份「异机」账本（别的系统的工作空间名、Anthropic 驼峰风格 usage、
+损坏 JSON 行、缺时间戳的记录、无 usage 的本地事件、缺失的价格表），
+然后断言脚本仍能正确统计。预期以「✅ 全部通过」结尾。
 
 ## 注意
 

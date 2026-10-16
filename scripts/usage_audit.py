@@ -2,19 +2,25 @@
 """
 usage_audit.py —— WorkBuddy 模型用量审计（请求级真实 usage）
 
-数据源：~/.workbuddy/projects/<工作空间>/<会话>.jsonl 里每条记录的
+数据源一（用量与成本）：~/.workbuddy/projects/<工作空间>/<会话>.jsonl 里每条记录的
         providerData.rawUsage（供应商响应里回的真实 usage，不是估算）
         providerData.model          → 模型名
         记录顶层 timestamp（毫秒）  → 时间
         子代理 subagents/agent-*.jsonl 自动归属父会话
 
-用途：回答「我这个模型用了多少 token / 花了多少 / 哪个项目最贵 / 缓存命中率多少」，
+数据源二（生成速度）：~/.workbuddy/logs/<日期>/<工作区>__<hash>.log 里 qua.end 行的
+        completion_tokens / ttft_ms / total_cost_ms / sse_connect_cost_ms
+        用量账本里没有耗时字段，速度只能从日志取；日志按日期分目录且有留存期限，
+        归档（目录名带 .expired）或删除后该日期的速度不再可得。
+
+用途：回答「我这个模型用了多少 token / 花了多少 / 哪个项目最贵 / 缓存命中率多少 /
+      回复速度多快、慢在排队还是慢在生成」，
       输出纯文本（默认）、Markdown（--out）、JSON（--json）或 CSV（--csv）。
 
 仅依赖 Python 标准库（3.8+）。
 
 常用示例：
-    python usage_audit.py                                   # 全量总览
+    python usage_audit.py                                   # 全量总览（含生成速度）
     python usage_audit.py --days 7                          # 最近 7 天
     python usage_audit.py --since 2026-10-01 --until 2026-10-14
     python usage_audit.py --model deepseek                   # 只看某模型（子串匹配）
@@ -22,6 +28,7 @@ usage_audit.py —— WorkBuddy 模型用量审计（请求级真实 usage）
     python usage_audit.py --group day                         # 只按天看
     python usage_audit.py --requests 15                       # 附最近 15 条请求明细
     python usage_audit.py --context                           # 附会话上下文占用
+    python usage_audit.py --no-speed                          # 只报用量，跳过生成速度
     python usage_audit.py --csv 用量.csv --out 用量报告.md     # 同时导出
 """
 
@@ -41,11 +48,20 @@ except Exception:
     pass
 
 DEFAULT_PROJECTS = os.path.join(os.path.expanduser("~"), ".workbuddy", "projects")
+DEFAULT_LOGS = os.path.join(os.path.expanduser("~"), ".workbuddy", "logs")
 DEFAULT_DB = os.path.join(os.path.expanduser("~"), ".workbuddy", "workbuddy.db")
 DEFAULT_SESSIONS_DIR = os.path.join(os.path.expanduser("~"), ".workbuddy", "sessions")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PRICES = os.path.join(os.path.dirname(HERE), "assets", "prices.json")
 INTERNAL_TAG = re.compile(r"^\s*<")
+
+# 日志目录名：2026-10-16 或 2026-10-16.expired-<ts>-<hash>（归档后仍留在本机）
+LOG_DATE_DIR = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:\.expired-.*)?$")
+# qua.end 行首形如：[2026/10/16 11:27:10.530] [Info] [pid=23996] [ModelProvider] ...
+LOG_LINE_TIME = re.compile(r"^\[(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})")
+LOG_JSON = re.compile(r"\{.*\}")
+# 未指定时间范围时，生成速度默认只看最近这么多天的日志（避免逐行扫全部日志）
+SPEED_DEFAULT_DAYS = 7
 
 
 # ------------------------------------------------------------------ 小工具
@@ -287,6 +303,202 @@ def read_context_usage(db_path, sessions_dir):
     return rows, None
 
 
+# ------------------------------------------------------------------ 生成速度（取自日志）
+
+def to_int(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def ws_slugs(projects_dir):
+    """列出工作空间目录名（全路径 slug），用来把日志短名对应回工作空间"""
+    if not os.path.isdir(projects_dir):
+        return []
+    return [d for d in os.listdir(projects_dir)
+            if os.path.isdir(os.path.join(projects_dir, d))]
+
+
+def match_log_ws(short, slugs):
+    """日志文件名里是工作空间短名（cclear），projects 里是路径 slug
+    （d-1-a-mycode-ai-code-cclear）——短名就是 slug 的最后一段。
+
+    匹配不上的一律不计入：那些是 WorkBuddy 自身功能的日志
+    （teams / sdk / daemon-* / edge-sync / unknown-workspace 等），不属于用户的工作空间。
+    """
+    if not short:
+        return None
+    hits = [s for s in slugs if s == short or s.endswith("-" + short)]
+    return max(hits, key=len) if hits else None
+
+
+def load_speed(logs_dir, slugs, since_ms, until_ms, ws_filter):
+    """扫描 logs/<日期>/<工作区>__<hash>.log 的 qua.end 行，取出耗时与输出 token。
+
+    qua.end 是每次模型调用结束时写出的一行 JSON，含：
+        completion_tokens    输出 token（已含思考链）
+        ttft_ms              首字延迟
+        total_cost_ms        整轮耗时
+        sse_connect_cost_ms  建连 / 等服务端首个响应的耗时
+
+    返回 (rows, meta)；meta["error"] 非空表示这一次没取到速度数据（不影响用量部分）。
+    """
+    meta = {"days": [], "skipped": collections.Counter(), "error": None}
+    if not os.path.isdir(logs_dir):
+        meta["error"] = "日志目录不存在：%s" % logs_dir
+        return [], meta
+
+    rows = []
+    for daydir in sorted(os.listdir(logs_dir)):
+        m = LOG_DATE_DIR.match(daydir)
+        if not m:
+            continue                                  # sdk / teams 等非日期目录跳过
+        day = m.group(1)
+        try:
+            day_start = int(datetime.datetime.strptime(day, "%Y-%m-%d").timestamp() * 1000)
+        except ValueError:
+            continue
+        if since_ms and day_start + 86400000 - 1 < since_ms:
+            continue
+        if until_ms and day_start > until_ms:
+            continue
+        base = os.path.join(logs_dir, daydir)
+        if not os.path.isdir(base):
+            continue
+        meta["days"].append(day)
+
+        for fp in sorted(glob.glob(os.path.join(base, "*.log"))):
+            fname = os.path.basename(fp)
+            short = fname.rsplit("__", 1)[0] if "__" in fname else ""
+            if short.endswith(".log"):
+                short = short[:-4]
+            ws_key = match_log_ws(short, slugs)
+            if not ws_key:
+                if short:
+                    meta["skipped"][short] += 1
+                continue
+            ws = short                                 # 日志里就是短名，比全路径 slug 好读
+            if ws_filter:
+                f = ws_filter.lower()
+                if f not in ws_key.lower() and f not in ws.lower():
+                    continue
+
+            try:
+                fh = open(fp, encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    idx = line.find("qua.end:")
+                    if idx < 0:
+                        continue                       # 绝大多数行在这里就被跳过
+                    jm = LOG_JSON.search(line, idx + 8)
+                    if not jm:
+                        continue
+                    try:
+                        o = json.loads(jm.group(0))
+                    except ValueError:
+                        continue
+                    if str(o.get("http_end_status_code")) != "200":
+                        continue                       # 失败请求不计入速度
+                    outp = to_int(o.get("completion_tokens"))
+                    total = to_int(o.get("total_cost_ms"))
+                    ttft = to_int(o.get("ttft_ms"))
+                    if outp <= 0 or total <= 0:
+                        continue
+
+                    ts = 0
+                    tm = LOG_LINE_TIME.match(line)
+                    if tm:
+                        try:
+                            ts = int(datetime.datetime(
+                                int(tm.group(1)), int(tm.group(2)), int(tm.group(3)),
+                                int(tm.group(4)), int(tm.group(5)), int(tm.group(6))
+                            ).timestamp() * 1000)
+                        except ValueError:
+                            ts = 0
+                    if since_ms and ts and ts < since_ms:
+                        continue
+                    if until_ms and ts and ts > until_ms:
+                        continue
+
+                    gen_ms = total - ttft                # 真正在出字的时长
+                    rows.append({
+                        "ts": ts,
+                        "day": day,
+                        "ws": ws,
+                        "model": (o.get("model") or "").split("/")[-1],
+                        "out": outp,
+                        "ttft": ttft,
+                        "total": total,
+                        "connect": to_int(o.get("sse_connect_cost_ms")),
+                        "gen_tps": (outp / gen_ms * 1000.0) if gen_ms > 0 else None,
+                        "e2e_tps": outp / total * 1000.0,
+                    })
+    if not rows and meta["error"] is None:
+        meta["error"] = "日志里没有可用的速度记录"
+    return rows, meta
+
+
+def median(values):
+    v = sorted(values)
+    if not v:
+        return 0.0
+    mid = len(v) // 2
+    return float(v[mid]) if len(v) % 2 else (v[mid - 1] + v[mid]) / 2.0
+
+
+def percentile(values, p):
+    """线性插值分位（p 取 0~100）"""
+    v = sorted(values)
+    if not v:
+        return 0.0
+    if len(v) == 1:
+        return float(v[0])
+    k = (len(v) - 1) * p / 100.0
+    lo = int(k)
+    hi = min(lo + 1, len(v) - 1)
+    return v[lo] + (v[hi] - v[lo]) * (k - lo)
+
+
+def speed_summary(rows):
+    """把速度记录汇总成（全局统计, 按工作空间明细）"""
+    if not rows:
+        return None, []
+    tps = [r["gen_tps"] for r in rows if r["gen_tps"]]
+    overall = {
+        "requests": len(rows),
+        "out": sum(r["out"] for r in rows),
+        "gen_tps": median(tps),
+        "gen_tps_p10": percentile(tps, 10),
+        "gen_tps_p90": percentile(tps, 90),
+        "ttft": median([r["ttft"] for r in rows]),
+        "ttft_max": max(r["ttft"] for r in rows),
+        "total": median([r["total"] for r in rows]),
+        "total_max": max(r["total"] for r in rows),
+        "connect_share": median([r["connect"] / r["total"] * 100.0
+                                 for r in rows if r["total"]]),
+    }
+    grouped = collections.defaultdict(list)
+    for r in rows:
+        grouped[r["ws"]].append(r)
+    per_ws = []
+    for ws, rs in grouped.items():
+        per_ws.append({
+            "ws": ws,
+            "requests": len(rs),
+            "out": sum(x["out"] for x in rs),
+            "gen_tps": median([x["gen_tps"] for x in rs if x["gen_tps"]]),
+            "ttft": median([x["ttft"] for x in rs]),
+            "total": median([x["total"] for x in rs]),
+            "connect_share": median([x["connect"] / x["total"] * 100.0
+                                     for x in rs if x["total"]]),
+        })
+    per_ws.sort(key=lambda x: -x["requests"])
+    return overall, per_ws
+
+
 # ------------------------------------------------------------------ 聚合与报表
 
 def aggregate(records, prices):
@@ -367,6 +579,34 @@ def build_report(records, sessions, prices, args, buckets, titles, grand, extra)
         add("  预估金额           : ≈ %.2f 元（按牌价估算，仅供参考）" % grand["cost"])
     add("")
 
+    if not args.no_speed:
+        add("【生成速度】数据源：logs/qua.end（用量账本没有耗时字段，速度只能取自日志）")
+        speed_rows, speed_meta = extra.get("speed", ([], {}))
+        if not speed_rows:
+            if args.ws:
+                add("  本次未取到速度数据：筛选条件 '%s' 下没有对应的日志记录。" % args.ws)
+            else:
+                add("  本次未取到速度数据：%s" % (speed_meta.get("error") or "无"))
+        else:
+            overall, per_ws = speed_summary(speed_rows)
+            add("  %-30s %6s %11s %12s %11s %11s" % (
+                "工作区（短名）", "请求", "输出tok", "生成tok/s", "首字ms", "整轮ms"))
+            for w in per_ws[:args.top]:
+                add("  %-30s %6s %11s %12.1f %11s %11s" % (
+                    w["ws"][:30], num(w["requests"]), num(w["out"]),
+                    w["gen_tps"], num(w["ttft"]), num(w["total"])))
+            add("  ——汇总—— 生成速度中位 %.1f tok/s（P10~P90 %.1f ~ %.1f）｜ "
+                "首字延迟中位 %s ms（最慢 %s）"
+                % (overall["gen_tps"], overall["gen_tps_p10"], overall["gen_tps_p90"],
+                   num(overall["ttft"]), num(overall["ttft_max"])))
+            add("            整轮耗时中位 %s ms（最慢 %s）｜ 等待首字占整轮 %s"
+                % (num(overall["total"]), num(overall["total_max"]),
+                   pct(overall["connect_share"], 100)))
+            days = speed_meta.get("days") or []
+            if days:
+                add("  日志覆盖：%s ~ %s（共 %d 天）" % (min(days), max(days), len(days)))
+        add("")
+
     groups = args.group or ["model", "day", "ws"]
     if "model" in groups:
         add("【按模型】")
@@ -433,6 +673,13 @@ def build_report(records, sessions, prices, args, buckets, titles, grand, extra)
     add("     → 要贴合真实账单，请修改 assets/prices.json，或用 --price-in/--price-out/--price-cache 覆盖。")
     add("  4. 只统计「有 usage 字段」的请求；供应商不回 usage 时该模型不会出现在报表里。")
     add("  5. 全程本地读取，无任何上传。")
+    if not args.no_speed:
+        add("  6. 【生成速度】取自 logs 下的 qua.end 记录：")
+        add("     生成速度 = 输出token ÷ (总耗时 − 首字延迟)；端到端速度 = 输出token ÷ 总耗时；")
+        add("     输出 token 已含思考链。它与用量账本不同源，只覆盖日志仍在的日期——")
+        add("     日志按日期留存，一旦被归档清理，那几天的速度就不再可得。")
+        add("     只统计日志里成功（HTTP 200）且有输出 token 的请求，故请求数可能与用量节的略有出入；")
+        add("     工作区在速度节显示为短名（如 cclear），对应用量节里 slug 的最后一段。")
     return "\n".join(out)
 
 
@@ -466,6 +713,10 @@ def main():
     ap.add_argument("--top", type=int, default=25, help="每组最多显示行数")
     ap.add_argument("--requests", type=int, default=0, help="附最近 N 条请求明细")
     ap.add_argument("--context", action="store_true", help="附会话上下文占用")
+    ap.add_argument("--logs", default=DEFAULT_LOGS, help="日志目录（生成速度的数据源）")
+    ap.add_argument("--no-speed", action="store_true", help="不统计生成速度")
+    ap.add_argument("--speed-days", type=int, default=SPEED_DEFAULT_DAYS,
+                    help="未指定时间范围时速度只看最近 N 天日志，0=不限（默认 %d）" % SPEED_DEFAULT_DAYS)
     ap.add_argument("--prices", default=DEFAULT_PRICES, help="价格表 json 路径")
     ap.add_argument("--price-in", type=float, default=None, help="兜底输入价（元/百万）")
     ap.add_argument("--price-out", type=float, default=None, help="兜底输出价（元/百万）")
@@ -501,6 +752,13 @@ def main():
     extra = {}
     if args.context:
         extra["context"] = read_context_usage(args.db, args.sessions_dir)
+    if not args.no_speed:
+        s_since, s_until = since_ms, until_ms
+        if not since_ms and not until_ms and args.speed_days:
+            s_since = int((datetime.datetime.now()
+                           - datetime.timedelta(days=args.speed_days)).timestamp() * 1000)
+        extra["speed"] = load_speed(args.logs, ws_slugs(args.projects),
+                                    s_since, s_until, args.ws)
 
     report = build_report(records, sessions, prices, args, buckets, titles, grand, extra)
     print(report)
@@ -528,6 +786,15 @@ def main():
             "by_day": {k: dict(v) for k, v in buckets["day"].items()},
             "by_ws": {k: dict(v) for k, v in buckets["ws"].items()},
         }
+        s_rows, s_meta = extra.get("speed", ([], {}))
+        s_overall, s_per_ws = speed_summary(s_rows)
+        if s_overall:
+            payload["speed"] = {
+                "source": args.logs,
+                "days": s_meta.get("days", []),
+                "overall": s_overall,
+                "by_ws": s_per_ws,
+            }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
         print("[已写出 JSON] %s" % path)

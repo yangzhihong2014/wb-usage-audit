@@ -106,19 +106,46 @@ select session_id, used, size, updated_at from session_usage order by updated_at
 
 ---
 
-## 五、日志里的耗时/首字延迟（补充源）
+## 五、生成速度（来自日志，与用量账本不同源）
 
 ```
 ~/.workbuddy/logs/<日期>/<工作区>__<hash>.log
 ```
 
-搜 `[ModelProvider] ... qua.end:` 那一行，JSON 里有：
+行首形如 `[2026/10/16 11:27:10.530] [Info] [pid=23996] [ModelProvider] [SseMonitor#xxx] qua.end: {...}`，
+`qua.end` 后面就是这次调用结束时写出的 JSON：
 
-`model` / `agent_name` / `scene` / `request_type` / `prompt_tokens` / `completion_tokens` /
-`total_tokens` / `ttft_ms`（首字延迟）/ `total_cost_ms` / `finish_reason` / `text_total_tokens` /
-`think_total_tokens`（思维链 token）。
+| 字段 | 含义 |
+|---|---|
+| `completion_tokens` | 输出 token（**已含思考链**） |
+| `prompt_tokens` | 输入 token（与账本口径一致，含缓存命中） |
+| `ttft_ms` | 首字延迟 |
+| `total_cost_ms` | 整轮耗时（含首字等待） |
+| `sse_connect_cost_ms` | 建连 / 等服务端首个响应的耗时，数值上几乎等于 `ttft_ms` |
+| `http_end_status_code` | `200` 才算成功，其余是失败请求 |
 
-同目录里 `Request failed with status code N` 与 `Error response: status=N` 是失败记录，用于排查。
+口径：
+
+```
+生成速度   = completion_tokens ÷ (total_cost_ms − ttft_ms) × 1000
+端到端速度 = completion_tokens ÷ total_cost_ms × 1000
+```
+
+> `text_total_tokens` / `think_total_tokens` 数值极小（个位到十位），**不是 token 计数**，
+> 不要拿来代替 `completion_tokens`。
+
+### 用日志时要注意的几件事
+
+1. **日志按日期分目录，且有留存期限。** 过期目录会被重命名为 `<日期>.expired-<ts>-<hash>`，
+   文件仍在，脚本照样能读；再往后被清理掉，那几天的速度就永久不可得——所以速度只覆盖最近约两周。
+2. **文件名里是工作区短名**（`cclear__<hash>.log`），而 `projects/` 里是全路径 slug
+   （`d-1-a-mycode-ai-code-cclear`）。短名是 slug 的最后一段，脚本按后缀配对；配不上的
+   （`teams*` / `sdk` / `daemon-*` / `edge-sync` / `unknown-workspace` / `__workbuddy_cli_host__*`）
+   是 WorkBuddy 自身功能日志，不计入。
+3. **只统计 HTTP 200 且有输出 token 的请求**，所以速度节的请求数会略少于用量节。
+4. **日志体积大**（单工作区单日可达 10~30 MB）。请求时加 `--days` 缩小范围；不指定时间范围时，
+   脚本默认只看最近 7 天（`--speed-days` 可调，`0` 表示不限）。
+5. 同目录里 `Request failed with status code N` 与 `Error response: status=N` 是失败记录，用于排查。
 
 ---
 
